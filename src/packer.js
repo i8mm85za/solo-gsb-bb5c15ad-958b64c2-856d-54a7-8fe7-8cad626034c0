@@ -490,4 +490,212 @@ function layoutBatch(input) {
   };
 }
 
-module.exports = { layout, layoutBatch };
+/**
+ * 多纸型成本排产：在 2～8 种候选纸型中按单位成本贪心选纸，逐张排样。
+ *
+ * 每轮对所有「仍有库存」的纸型，用与 layout() 完全相同的断头台规则
+ * 试排当前剩余需求，再按以下优先级选出下一张用纸：
+ *  1. 单位已排成品面积成本最低（单价 / 该张已排成品面积）
+ *  2. 同分时已排件数多者优先
+ *  3. 再同分按录入顺序（先录入者优先）
+ *
+ * 选中后扣减该纸型库存与剩余需求。试排一件都排不进的纸型本轮不参选，
+ * 也绝不扣库存——空白纸不计入结果。终止条件：
+ *  - 全部成品排完                     → stopReason: 'completed'
+ *  - 所有纸型库存耗尽仍有剩余         → stopReason: 'stock-exhausted'
+ *  - 仍有库存但所有纸型都排不进余件   → stopReason: 'no-progress'
+ * （每轮至多消耗一张纸且至少排入一件，库存总量有限，必然终止）
+ *
+ * @param {object} input
+ *   kerf: number(mm)
+ *   papers: [{ name?, width, height, price, stock }]  2～8 种；
+ *     单价须大于 0，可用张数须为 0～500 的整数
+ *   products: 同 layout()
+ * @returns {{
+ *   kerf: number, stopReason: string,
+ *   summary: { paperTypes, sheetsUsed, piecesPlaced, piecesTotal, completionRate, cutsTotal, totalCost },
+ *   paperUsage: Array, // 各纸型用量：库存/已用/剩余/小计成本
+ *   sheets: Array,     // 逐张：纸型、选择指标（单位面积成本等）与完整 layout() 结果
+ *   remaining: Array   // 仍未排入的成品（结构同 layout() 的 unplaced）
+ * }}
+ */
+function layoutCostBatch(input) {
+  const kerf = Number(input.kerf);
+  if (!Number.isFinite(kerf)) throw new Error('刀缝宽度不是有效数字');
+  if (kerf < 0) throw new Error('刀缝宽度不能为负');
+
+  if (!Array.isArray(input.papers)) throw new Error('缺少候选纸型列表');
+  if (input.papers.length < 2 || input.papers.length > 8) {
+    throw new Error('候选纸型数量须为 2～8 种');
+  }
+  const papers = input.papers.map((raw, idx) => {
+    const p = raw || {};
+    const width = Number(p.width);
+    const height = Number(p.height);
+    const price = Number(p.price);
+    const stock = Number(p.stock);
+    if (![width, height].every((n) => Number.isFinite(n)) || width <= 0 || height <= 0) {
+      throw new Error(`第 ${idx + 1} 种纸型的宽高必须为正数`);
+    }
+    if (!Number.isFinite(price) || price <= 0) {
+      throw new Error(`第 ${idx + 1} 种纸型的单价必须大于 0`);
+    }
+    if (!Number.isInteger(stock) || stock < 0 || stock > 500) {
+      throw new Error(`第 ${idx + 1} 种纸型的可用张数须为 0～500 的整数`);
+    }
+    const name = p.name && String(p.name).trim() ? String(p.name).trim() : `纸型${idx + 1}`;
+    return { idx, name, width, height, price, stock, initStock: stock, used: 0, cost: 0 };
+  });
+
+  // 以第一种纸试排一次：沿用 layout 完成成品清单校验，
+  // 若该纸型有库存，此结果直接作为首轮评估复用，不浪费
+  const probe = layout({
+    paperW: papers[0].width,
+    paperH: papers[0].height,
+    kerf,
+    products: input.products,
+  });
+  const totalPieces = probe.stats.piecesTotal;
+
+  const originalTotal = new Map(); // id → 原始需求件数
+  const initialUnplaced = [];      // 一张纸都没用时，剩余即全部原始需求
+  input.products.forEach((p, idx) => {
+    const q = Math.floor(Number(p.quantity));
+    if (!(q > 0)) return;
+    const id = p.id != null ? String(p.id) : `P${idx + 1}`;
+    originalTotal.set(id, (originalTotal.get(id) || 0) + q);
+    initialUnplaced.push({
+      id,
+      name: p.name && String(p.name).trim() ? String(p.name).trim() : '',
+      width: Number(p.width),
+      height: Number(p.height),
+      total: q,
+      quantity: q,
+    });
+  });
+
+  const COST_EPS = 1e-12; // 单位面积成本同分判定容差
+  const sheets = [];
+  let demand = input.products;
+  let lastUnplaced = initialUnplaced;
+  let placedTotal = 0;
+  let cutsTotal = 0;
+  let stopReason = 'completed';
+  let firstRound = true;
+
+  while (placedTotal < totalPieces) {
+    let best = null; // { paper, result, costPerArea, pieces }
+    let anyStock = false;
+
+    for (const p of papers) {
+      if (p.stock <= 0) continue;
+      anyStock = true;
+      const result = firstRound && p.idx === 0
+        ? probe
+        : layout({ paperW: p.width, paperH: p.height, kerf, products: demand });
+      if (result.stats.piecesPlaced === 0) continue; // 空白纸：不参选、不扣库存
+      const cand = {
+        paper: p,
+        result,
+        costPerArea: p.price / result.stats.placedArea,
+        pieces: result.stats.piecesPlaced,
+      };
+      if (
+        !best ||
+        cand.costPerArea < best.costPerArea - COST_EPS ||
+        (Math.abs(cand.costPerArea - best.costPerArea) <= COST_EPS &&
+          (cand.pieces > best.pieces ||
+            (cand.pieces === best.pieces && cand.paper.idx < best.paper.idx)))
+      ) {
+        best = cand;
+      }
+    }
+    firstRound = false;
+
+    if (!best) {
+      stopReason = anyStock ? 'no-progress' : 'stock-exhausted';
+      break;
+    }
+
+    const { paper, result } = best;
+    paper.stock -= 1;
+    paper.used += 1;
+    paper.cost += paper.price;
+    placedTotal += result.stats.piecesPlaced;
+    cutsTotal += result.stats.cutsTotal;
+    lastUnplaced = result.unplaced;
+
+    sheets.push({
+      seq: sheets.length + 1,
+      paperType: {
+        idx: paper.idx,
+        name: paper.name,
+        width: round3(paper.width),
+        height: round3(paper.height),
+        price: paper.price,
+      },
+      metrics: {
+        unitPrice: paper.price,
+        placedArea: result.stats.placedArea,
+        piecesPlaced: result.stats.piecesPlaced,
+        costPerArea: Number((paper.price / result.stats.placedArea).toPrecision(6)),
+      },
+      layout: result,
+    });
+
+    // 扣除本张已排数量，剩余需求进入下一轮选纸
+    demand = result.unplaced.map((u) => ({
+      id: u.id,
+      name: u.name,
+      width: u.width,
+      height: u.height,
+      quantity: u.quantity,
+    }));
+  }
+
+  const remaining = lastUnplaced.map((u) => {
+    const total = originalTotal.has(u.id) ? originalTotal.get(u.id) : u.total;
+    return {
+      id: u.id,
+      name: u.name,
+      width: u.width,
+      height: u.height,
+      total,
+      placed: total - u.quantity,
+      quantity: u.quantity,
+    };
+  });
+
+  const paperUsage = papers.map((p) => ({
+    idx: p.idx,
+    name: p.name,
+    width: round3(p.width),
+    height: round3(p.height),
+    price: p.price,
+    stock: p.initStock,
+    used: p.used,
+    remaining: p.stock,
+    cost: round3(p.cost),
+  }));
+  const totalCost = papers.reduce((s, p) => s + p.cost, 0);
+  const completionRate = totalPieces > 0 ? placedTotal / totalPieces : 1;
+
+  return {
+    kerf: round3(kerf),
+    stopReason,
+    summary: {
+      paperTypes: papers.length,
+      sheetsUsed: sheets.length,
+      piecesPlaced: placedTotal,
+      piecesTotal: totalPieces,
+      completionRate: round3(completionRate * 1000) / 1000, // 0..1
+      cutsTotal,
+      totalCost: round3(totalCost),
+    },
+    paperUsage,
+    sheets,
+    remaining,
+  };
+}
+
+module.exports = { layout, layoutBatch, layoutCostBatch };

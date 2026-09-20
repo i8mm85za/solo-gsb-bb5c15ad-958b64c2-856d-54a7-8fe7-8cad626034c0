@@ -9,23 +9,23 @@
 <body>
   <header class="topbar">
     <h1>单张纸直线裁切试排</h1>
-    <p class="subtitle">断头台式裁切 · 每次一刀切到底、一分为二 · 成品允许旋转 90° · 刀缝不侵占成品 · 支持单张试排与批量排产</p>
+    <p class="subtitle">断头台式裁切 · 每次一刀切到底、一分为二 · 成品允许旋转 90° · 刀缝不侵占成品 · 支持单张试排、批量排产与多纸型成本排产</p>
   </header>
 
   <main class="layout">
     <section class="panel form-panel">
       <h2>纸张与刀缝</h2>
       <div class="field-grid">
-        <label>纸张宽度 (mm)
+        <label id="paperWField">纸张宽度 (mm)
           <input type="number" id="paperW" value="889" min="1" step="0.5" />
         </label>
-        <label>纸张高度 (mm)
+        <label id="paperHField">纸张高度 (mm)
           <input type="number" id="paperH" value="1194" min="1" step="0.5" />
         </label>
         <label>刀缝宽度 (mm)
           <input type="number" id="kerf" value="3" min="0" step="0.1" />
         </label>
-        <label class="preset">常用纸度
+        <label class="preset" id="presetField">常用纸度
           <select id="preset">
             <option value="">— 自定义 —</option>
             <option value="297x420">A3 297×420</option>
@@ -41,12 +41,21 @@
       <div class="mode-switch">
         <label><input type="radio" name="mode" value="single" checked /> 单张试排</label>
         <label><input type="radio" name="mode" value="batch" /> 批量排产</label>
+        <label><input type="radio" name="mode" value="cost" /> 多纸型成本排产</label>
       </div>
       <div id="batchOpts" class="batch-opts" hidden>
         <label>最多用纸张数（张）
           <input type="number" id="maxSheets" value="10" min="1" max="500" step="1" />
         </label>
         <p class="hint">按当前规则逐张排样；全部排完、达到用纸上限，或某张纸排不进任何成品时停止（无进展立即止损，不生成空白纸）。</p>
+      </div>
+      <div id="costOpts" class="batch-opts" hidden>
+        <div class="papers-head">
+          <span>名称（可选）</span><span>宽 mm</span><span>高 mm</span><span>单价 元/张</span><span>可用张数</span><span></span>
+        </div>
+        <div id="paperRows"></div>
+        <button type="button" id="addPaperRow" class="btn btn-ghost">＋ 添加纸型（2–8 种）</button>
+        <p class="hint">每轮在所有仍有库存的纸型中试排剩余成品，按「单位已排成品面积成本最低 → 已排件数多 → 录入顺序」选出下一张用纸；全部完成、库存耗尽或所有纸型均无进展时停止，空白纸不计入结果。</p>
       </div>
 
       <h2>成品清单</h2>
@@ -67,6 +76,7 @@
       <h2>排料结果</h2>
       <div id="batchBar" class="batch-bar" hidden></div>
       <div id="sheetTabs" class="sheet-tabs" hidden></div>
+      <div id="sheetInfo" class="sheet-info" hidden></div>
       <div id="stats" class="stats"></div>
       <div id="svgWrap" class="svg-wrap">
         <div class="placeholder">填写左侧参数后点击「生成裁切方案」</div>

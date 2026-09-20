@@ -2,7 +2,7 @@
 
 const assert = require('node:assert');
 const { test } = require('node:test');
-const { layout, layoutBatch } = require('../src/packer');
+const { layout, layoutBatch, layoutCostBatch } = require('../src/packer');
 
 const EPS = 1e-6;
 
@@ -268,7 +268,7 @@ test('批量：逐张扣减单调收敛（多种规格混合）', () => {
   for (const sh of r.sheets) assert.ok(sh.stats.piecesPlaced > 0);
 });
 
-test('批量：maxSheets 与成品输入校验', () => {
+test('批量校验：maxSheets 与成品输入校验', () => {
   assert.throws(() => layoutBatch({ paperW: 100, paperH: 100, kerf: 1, maxSheets: 0, products: [] }));
   assert.throws(() => layoutBatch({ paperW: 100, paperH: 100, kerf: 1, maxSheets: 2.5, products: [] }));
   assert.throws(() => layoutBatch({ paperW: 100, paperH: 100, kerf: 1, maxSheets: 501, products: [] }));
@@ -276,5 +276,228 @@ test('批量：maxSheets 与成品输入校验', () => {
   // 成品校验沿用单张规则
   assert.throws(() =>
     layoutBatch({ paperW: 100, paperH: 100, kerf: 1, maxSheets: 3, products: [{ width: -1, height: 10, quantity: 1 }] })
+  );
+});
+
+/* ---------------- 多纸型成本排产 ---------------- */
+
+test('成本排产：单价低者先用完，库存耗尽后切换贵纸', () => {
+  const r = layoutCostBatch({
+    kerf: 0,
+    papers: [
+      { name: '便宜', width: 100, height: 100, price: 1, stock: 2 },
+      { name: '贵', width: 100, height: 100, price: 5, stock: 5 },
+    ],
+    products: [{ width: 100, height: 100, quantity: 4 }],
+  });
+  assert.strictEqual(r.stopReason, 'completed');
+  assert.strictEqual(r.summary.sheetsUsed, 4);
+  assert.deepStrictEqual(r.sheets.map((s) => s.paperType.name), ['便宜', '便宜', '贵', '贵']);
+  assert.strictEqual(r.summary.totalCost, 2 * 1 + 2 * 5);
+  const cheap = r.paperUsage.find((u) => u.name === '便宜');
+  assert.strictEqual(cheap.used, 2);
+  assert.strictEqual(cheap.remaining, 0);
+  assert.strictEqual(cheap.cost, 2);
+  const dear = r.paperUsage.find((u) => u.name === '贵');
+  assert.strictEqual(dear.used, 2);
+  assert.strictEqual(dear.remaining, 3);
+});
+
+test('成本排产：按单位已排面积成本选纸，而非单价高低', () => {
+  // A：单价 1 排 1 件 → 1/10000；B：单价 3 排 4 件 → 3/40000 < 1/10000
+  const r = layoutCostBatch({
+    kerf: 0,
+    papers: [
+      { name: 'A', width: 100, height: 100, price: 1, stock: 5 },
+      { name: 'B', width: 200, height: 200, price: 3, stock: 5 },
+    ],
+    products: [{ width: 100, height: 100, quantity: 4 }],
+  });
+  assert.strictEqual(r.stopReason, 'completed');
+  assert.strictEqual(r.summary.sheetsUsed, 1);
+  assert.strictEqual(r.sheets[0].paperType.name, 'B');
+  assert.strictEqual(r.sheets[0].metrics.piecesPlaced, 4);
+  assert.strictEqual(r.summary.totalCost, 3);
+  // 选择指标自洽：costPerArea = 单价 / 已排面积
+  const m = r.sheets[0].metrics;
+  assert.ok(Math.abs(m.costPerArea - m.unitPrice / m.placedArea) < 1e-9);
+});
+
+test('成本排产：单位成本同分时选已排件数多者', () => {
+  // A：100×100 价 1 → 1 件，1/10000；B：100×200 价 2 → 2 件，2/20000 = 1/10000
+  const r = layoutCostBatch({
+    kerf: 0,
+    papers: [
+      { name: 'A', width: 100, height: 100, price: 1, stock: 5 },
+      { name: 'B', width: 100, height: 200, price: 2, stock: 5 },
+    ],
+    products: [{ width: 100, height: 100, quantity: 2 }],
+  });
+  assert.strictEqual(r.summary.sheetsUsed, 1);
+  assert.strictEqual(r.sheets[0].paperType.name, 'B');
+  assert.strictEqual(r.sheets[0].metrics.piecesPlaced, 2);
+});
+
+test('成本排产：完全同分时按录入顺序选纸', () => {
+  const r = layoutCostBatch({
+    kerf: 0,
+    papers: [
+      { name: '先', width: 100, height: 100, price: 2, stock: 3 },
+      { name: '后', width: 100, height: 100, price: 2, stock: 3 },
+    ],
+    products: [{ width: 100, height: 100, quantity: 2 }],
+  });
+  assert.deepStrictEqual(r.sheets.map((s) => s.paperType.name), ['先', '先']);
+  assert.strictEqual(r.paperUsage[0].used, 2);
+  assert.strictEqual(r.paperUsage[1].used, 0);
+});
+
+test('成本排产：库存全部耗尽即停，剩余件数正确', () => {
+  const r = layoutCostBatch({
+    kerf: 0,
+    papers: [
+      { name: 'A', width: 100, height: 100, price: 1, stock: 1 },
+      { name: 'B', width: 100, height: 100, price: 2, stock: 1 },
+    ],
+    products: [{ width: 100, height: 100, quantity: 5 }],
+  });
+  assert.strictEqual(r.stopReason, 'stock-exhausted');
+  assert.strictEqual(r.summary.sheetsUsed, 2);
+  assert.strictEqual(r.summary.piecesPlaced, 2);
+  assert.strictEqual(r.remaining[0].quantity, 3);
+  assert.strictEqual(r.remaining[0].total, 5);
+  assert.strictEqual(r.remaining[0].placed, 2);
+  assert.ok(r.paperUsage.every((u) => u.used === u.stock && u.remaining === 0));
+});
+
+test('成本排产：有库存但所有纸型都排不进时无进展止损，且不产生空白纸', () => {
+  const r = layoutCostBatch({
+    kerf: 0,
+    papers: [
+      { name: 'A', width: 100, height: 100, price: 1, stock: 2 },
+      { name: 'B', width: 120, height: 120, price: 3, stock: 2 },
+    ],
+    products: [
+      { width: 100, height: 100, quantity: 1 }, // 第一轮能排
+      { width: 500, height: 500, quantity: 2 }, // 任何纸型都排不进
+    ],
+  });
+  assert.strictEqual(r.stopReason, 'no-progress');
+  assert.strictEqual(r.summary.sheetsUsed, 1); // 空白纸不计入
+  assert.strictEqual(r.summary.piecesPlaced, 1);
+  const big = r.remaining.find((u) => u.width === 500);
+  assert.strictEqual(big.quantity, 2);
+  assert.strictEqual(big.placed, 0);
+  // 未中选的评估不扣库存：总用量 = 实际用纸 1 张
+  assert.strictEqual(r.paperUsage.reduce((s, u) => s + u.used, 0), 1);
+});
+
+test('成本排产：全部纸型零库存 → 立即库存耗尽，不用纸', () => {
+  const r = layoutCostBatch({
+    kerf: 0,
+    papers: [
+      { name: 'A', width: 100, height: 100, price: 1, stock: 0 },
+      { name: 'B', width: 200, height: 200, price: 2, stock: 0 },
+    ],
+    products: [{ width: 100, height: 100, quantity: 3 }],
+  });
+  assert.strictEqual(r.stopReason, 'stock-exhausted');
+  assert.strictEqual(r.sheets.length, 0);
+  assert.strictEqual(r.summary.sheetsUsed, 0);
+  assert.strictEqual(r.summary.totalCost, 0);
+  assert.strictEqual(r.summary.completionRate, 0);
+  assert.strictEqual(r.remaining[0].quantity, 3);
+});
+
+test('成本排产：零库存纸型不参与排产', () => {
+  const r = layoutCostBatch({
+    kerf: 0,
+    papers: [
+      { name: '零库存便宜纸', width: 100, height: 100, price: 0.5, stock: 0 },
+      { name: '有库存', width: 100, height: 100, price: 2, stock: 2 },
+    ],
+    products: [{ width: 100, height: 100, quantity: 1 }],
+  });
+  assert.strictEqual(r.sheets[0].paperType.name, '有库存');
+  assert.strictEqual(r.paperUsage[0].used, 0);
+  assert.strictEqual(r.paperUsage[0].remaining, 0);
+});
+
+test('成本排产：空需求直接完成，不用纸', () => {
+  const r = layoutCostBatch({
+    kerf: 0,
+    papers: [
+      { name: 'A', width: 100, height: 100, price: 1, stock: 2 },
+      { name: 'B', width: 200, height: 200, price: 2, stock: 2 },
+    ],
+    products: [],
+  });
+  assert.strictEqual(r.stopReason, 'completed');
+  assert.strictEqual(r.sheets.length, 0);
+  assert.strictEqual(r.summary.completionRate, 1);
+  assert.strictEqual(r.summary.totalCost, 0);
+});
+
+test('成本排产：逐张扣减一致，用量与成本汇总自洽（多规格混合）', () => {
+  const r = layoutCostBatch({
+    kerf: 3,
+    papers: [
+      { name: '大度', width: 889, height: 1194, price: 3.5, stock: 6 },
+      { name: '正度', width: 787, height: 1092, price: 3, stock: 6 },
+    ],
+    products: [
+      { name: '封面', width: 210, height: 285, quantity: 24 },
+      { name: '名片', width: 90, height: 54, quantity: 120 },
+    ],
+  });
+  // 每张计入的纸都非空白，且每张仍是合法的单张布局
+  for (const sh of r.sheets) {
+    assert.ok(sh.layout.stats.piecesPlaced > 0, '不应出现空白纸');
+    assert.ok(sh.metrics.placedArea > 0);
+    assert.strictEqual(sh.metrics.unitPrice, sh.paperType.price);
+    assert.strictEqual(sh.layout.paper.width, sh.paperType.width);
+    assert.strictEqual(sh.layout.paper.height, sh.paperType.height);
+  }
+  // 逐张已排之和 + 剩余 = 总需求
+  const placedSum = r.sheets.reduce((s, sh) => s + sh.layout.stats.piecesPlaced, 0);
+  const remainSum = r.remaining.reduce((s, u) => s + u.quantity, 0);
+  assert.strictEqual(placedSum, r.summary.piecesPlaced);
+  assert.strictEqual(placedSum + remainSum, 144);
+  // 各纸型用量与逐张记录一致，库存守恒
+  for (const u of r.paperUsage) {
+    assert.strictEqual(u.used, r.sheets.filter((sh) => sh.paperType.idx === u.idx).length);
+    assert.strictEqual(u.used + u.remaining, u.stock);
+  }
+  // 总成本 = 各纸型小计之和 = 逐张单价之和
+  const costByUsage = r.paperUsage.reduce((s, u) => s + u.cost, 0);
+  const costBySheets = r.sheets.reduce((s, sh) => s + sh.paperType.price, 0);
+  assert.ok(Math.abs(r.summary.totalCost - costByUsage) < 1e-6);
+  assert.ok(Math.abs(r.summary.totalCost - costBySheets) < 1e-6);
+  // 总刀数 = 各张刀数之和
+  assert.strictEqual(r.summary.cutsTotal, r.sheets.reduce((s, sh) => s + sh.layout.stats.cutsTotal, 0));
+});
+
+test('成本排产：纸型与成品参数校验', () => {
+  const P = (over = {}) => ({ name: 'A', width: 100, height: 100, price: 1, stock: 1, ...over });
+  const base = { kerf: 0, products: [{ width: 50, height: 50, quantity: 1 }] };
+  // 纸型数量须为 2～8
+  assert.throws(() => layoutCostBatch({ ...base, papers: [P()] }));
+  assert.throws(() => layoutCostBatch({ ...base, papers: Array.from({ length: 9 }, () => P()) }));
+  assert.throws(() => layoutCostBatch({ ...base })); // 缺 papers
+  // 单价须大于 0
+  assert.throws(() => layoutCostBatch({ ...base, papers: [P({ price: 0 }), P()] }));
+  assert.throws(() => layoutCostBatch({ ...base, papers: [P({ price: -2 }), P()] }));
+  // 张数须为 0～500 整数
+  assert.throws(() => layoutCostBatch({ ...base, papers: [P({ stock: -1 }), P()] }));
+  assert.throws(() => layoutCostBatch({ ...base, papers: [P({ stock: 1.5 }), P()] }));
+  assert.throws(() => layoutCostBatch({ ...base, papers: [P({ stock: 501 }), P()] }));
+  // 宽高须为正数
+  assert.throws(() => layoutCostBatch({ ...base, papers: [P({ width: 0 }), P()] }));
+  assert.throws(() => layoutCostBatch({ ...base, papers: [P({ height: -10 }), P()] }));
+  // 刀缝不能为负
+  assert.throws(() => layoutCostBatch({ kerf: -1, papers: [P(), P()], products: [] }));
+  // 成品校验沿用单张规则（即使库存全为 0 也会校验）
+  assert.throws(() =>
+    layoutCostBatch({ kerf: 0, papers: [P({ stock: 0 }), P({ stock: 0 })], products: [{ width: -1, height: 10, quantity: 1 }] })
   );
 });

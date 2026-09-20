@@ -34,15 +34,43 @@ function addProductRow(name = '', w = '', h = '', qty = '') {
   $('productRows').appendChild(row);
 }
 
-function readForm() {
-  const paperW = Number($('paperW').value);
-  const paperH = Number($('paperH').value);
-  const kerf = Number($('kerf').value);
+function addPaperRow(name = '', w = '', h = '', price = '', stock = '') {
+  const row = document.createElement('div');
+  row.className = 'papers-row';
+  row.innerHTML = `
+    <input type="text" class="pp-name" placeholder="如：大度 / 正度" value="${name}" />
+    <input type="number" class="pp-w" min="0" step="0.5" placeholder="宽" value="${w}" />
+    <input type="number" class="pp-h" min="0" step="0.5" placeholder="高" value="${h}" />
+    <input type="number" class="pp-price" min="0" step="0.01" placeholder="单价" value="${price}" />
+    <input type="number" class="pp-stock" min="0" max="500" step="1" placeholder="张数" value="${stock}" />
+    <button type="button" class="del" title="删除该行">✕</button>
+  `;
+  row.querySelector('.del').addEventListener('click', () => {
+    if ($('paperRows').children.length > 2) row.remove();
+  });
+  $('paperRows').appendChild(row);
+}
 
-  if (!(paperW > 0) || !(paperH > 0)) {
-    throw new Error('纸张宽高必须为正数。');
-  }
+function paperColor(idx) {
+  return PALETTE[idx % PALETTE.length];
+}
+
+function readForm() {
+  const mode = currentMode();
+  const kerf = Number($('kerf').value);
   if (!(kerf >= 0)) throw new Error('刀缝宽度必须是非负数。');
+
+  const payload = { kerf };
+
+  if (mode !== 'cost') {
+    const paperW = Number($('paperW').value);
+    const paperH = Number($('paperH').value);
+    if (!(paperW > 0) || !(paperH > 0)) {
+      throw new Error('纸张宽高必须为正数。');
+    }
+    payload.paperW = paperW;
+    payload.paperH = paperH;
+  }
 
   const products = [];
   [...$('productRows').querySelectorAll('.products-row')].forEach((row, i) => {
@@ -60,10 +88,9 @@ function readForm() {
       });
     }
   });
+  payload.products = products;
 
-  const payload = { paperW, paperH, kerf, products };
-
-  if (currentMode() === 'batch') {
+  if (mode === 'batch') {
     const maxSheets = Number($('maxSheets').value);
     if (!Number.isInteger(maxSheets) || maxSheets < 1 || maxSheets > 500) {
       throw new Error('最多用纸张数须为 1–500 的整数。');
@@ -71,11 +98,44 @@ function readForm() {
     payload.maxSheets = maxSheets;
   }
 
+  if (mode === 'cost') {
+    const papers = [];
+    [...$('paperRows').querySelectorAll('.papers-row')].forEach((row, i) => {
+      const name = row.querySelector('.pp-name').value.trim();
+      const width = Number(row.querySelector('.pp-w').value);
+      const height = Number(row.querySelector('.pp-h').value);
+      const price = Number(row.querySelector('.pp-price').value);
+      const stock = Number(row.querySelector('.pp-stock').value);
+      const blank = !name && !row.querySelector('.pp-w').value && !row.querySelector('.pp-h').value
+        && !row.querySelector('.pp-price').value && !row.querySelector('.pp-stock').value;
+      if (blank) return; // 空行跳过
+      if (!(width > 0) || !(height > 0)) {
+        throw new Error(`第 ${i + 1} 行纸型：宽高须为正数。`);
+      }
+      if (!(price > 0)) throw new Error(`第 ${i + 1} 行纸型：单价须大于 0。`);
+      if (!Number.isInteger(stock) || stock < 0 || stock > 500) {
+        throw new Error(`第 ${i + 1} 行纸型：可用张数须为 0–500 的整数。`);
+      }
+      papers.push({ name, width, height, price, stock });
+    });
+    if (papers.length < 2 || papers.length > 8) {
+      throw new Error('请填写 2–8 种候选纸型。');
+    }
+    payload.papers = papers;
+  }
+
   return payload;
 }
 
 function fmt(n) {
   return (Math.round(n * 100) / 100).toLocaleString('zh-CN');
+}
+
+// 单位已排面积成本（元/mm²）通常很小，过小时用科学计数法显示
+function fmtCostPerArea(v) {
+  if (!Number.isFinite(v)) return '—';
+  if (v !== 0 && Math.abs(v) < 0.001) return Number(v).toExponential(2);
+  return (Math.round(v * 1e6) / 1e6).toLocaleString('zh-CN');
 }
 
 function renderStats(r) {
@@ -306,6 +366,8 @@ function renderBatch(data) {
     </div>
   `;
   $('batchBar').hidden = false;
+  $('sheetInfo').hidden = true;
+  $('sheetInfo').innerHTML = '';
 
   const tabs = $('sheetTabs');
   if (data.sheets.length > 1) {
@@ -348,10 +410,112 @@ function showSheet(i) {
 
 function clearBatchUi() {
   batchState = null;
+  costState = null;
   $('batchBar').hidden = true;
   $('batchBar').innerHTML = '';
   $('sheetTabs').hidden = true;
   $('sheetTabs').innerHTML = '';
+  $('sheetInfo').hidden = true;
+  $('sheetInfo').innerHTML = '';
+}
+
+/* ---------------- 多纸型成本排产 ---------------- */
+
+let costState = null; // 最近一次成本排产结果
+
+const COST_STOP_REASONS = {
+  completed: (s) => ['ok', `✔ 全部完成：${s.piecesTotal} 件成品共排入 ${s.sheetsUsed} 张纸，总成本 ${fmt(s.totalCost)} 元。`],
+  'stock-exhausted': (s) => ['warn', `⚠ 所有纸型库存已耗尽，仍有 ${s.piecesTotal - s.piecesPlaced} 件未排，已停止。`],
+  'no-progress': (s) => ['warn', `⚠ 剩余成品在任何仍有库存的纸型上都排不进，已立即停止（未生成空白纸），剩余 ${s.piecesTotal - s.piecesPlaced} 件。`],
+};
+
+function renderCostBatch(data) {
+  costState = data;
+  const s = data.summary;
+  const pct = (s.completionRate * 100).toFixed(1);
+  const [cls, text] = (COST_STOP_REASONS[data.stopReason] || (() => ['warn', data.stopReason]))(s);
+  const mix = data.paperUsage.filter((u) => u.used > 0).map((u) => `${u.name}×${u.used}`).join('、') || '—';
+
+  const usageRows = data.paperUsage.map((u) => `
+    <tr>
+      <td><span class="paper-chip" style="background:${paperColor(u.idx)}"></span>${u.name}</td>
+      <td>${fmt(u.width)}×${fmt(u.height)}</td>
+      <td>${fmt(u.price)}</td>
+      <td>${u.used} / ${u.stock}</td>
+      <td>${u.remaining}</td>
+      <td>${fmt(u.cost)}</td>
+    </tr>
+  `).join('');
+
+  $('batchBar').innerHTML = `
+    <div class="stop-reason ${cls}">${text}</div>
+    <div class="stats">
+      <div class="stat">用纸数：<b>${s.sheetsUsed}</b> 张（${s.paperTypes} 种纸型）</div>
+      <div class="stat">混合用纸：<b>${mix}</b></div>
+      <div class="stat">已排/总数：<b>${s.piecesPlaced}/${s.piecesTotal}</b> 件</div>
+      <div class="stat">总刀数：<b>${s.cutsTotal}</b></div>
+      <div class="stat">总成本：<b>${fmt(s.totalCost)}</b> 元</div>
+      <div class="stat" style="flex-basis:100%">完成率：<b>${pct}%</b>
+        <div class="ratio-bar${s.completionRate < 1 ? ' low' : ''}"><span style="width:${(s.completionRate * 100).toFixed(2)}%"></span></div>
+      </div>
+    </div>
+    <div class="cost-table">
+      <h3>各纸型用量与成本</h3>
+      <table>
+        <thead><tr><th>纸型</th><th>规格 宽×高 (mm)</th><th>单价 (元/张)</th><th>已用 / 库存</th><th>剩余</th><th>小计 (元)</th></tr></thead>
+        <tbody>${usageRows}</tbody>
+        <tfoot><tr><td colspan="5">合计（${s.sheetsUsed} 张）</td><td><b>${fmt(s.totalCost)}</b></td></tr></tfoot>
+      </table>
+    </div>
+  `;
+  $('batchBar').hidden = false;
+
+  const tabs = $('sheetTabs');
+  if (data.sheets.length > 1) {
+    tabs.innerHTML = data.sheets.map((sh, i) =>
+      `<button type="button" data-i="${i}"><span class="paper-chip" style="background:${paperColor(sh.paperType.idx)}"></span>第 ${i + 1} 张 · ${sh.paperType.name}（${sh.metrics.piecesPlaced} 件）</button>`
+    ).join('');
+    [...tabs.querySelectorAll('button')].forEach((b) =>
+      b.addEventListener('click', () => showCostSheet(Number(b.dataset.i)))
+    );
+    tabs.hidden = false;
+  } else {
+    tabs.innerHTML = '';
+    tabs.hidden = true;
+  }
+
+  if (data.sheets.length) {
+    showCostSheet(0);
+  } else {
+    $('sheetInfo').hidden = true;
+    $('sheetInfo').innerHTML = '';
+    $('stats').innerHTML = '';
+    $('svgWrap').innerHTML = '<div class="placeholder">没有可用纸张布局（所有纸型均无库存，或都排不进任何成品）</div>';
+    $('cutList').innerHTML = '';
+  }
+
+  // 剩余需求（结构同单张的 unplaced）
+  renderUnplaced(
+    { unplaced: data.remaining, stats: { piecesTotal: s.piecesTotal } },
+    '未排完的成品（剩余需求）'
+  );
+}
+
+function showCostSheet(i) {
+  if (!costState || !costState.sheets[i]) return;
+  const sheet = costState.sheets[i];
+  [...$('sheetTabs').querySelectorAll('button')].forEach((b, j) =>
+    b.classList.toggle('active', j === i));
+  const pt = sheet.paperType;
+  const m = sheet.metrics;
+  $('sheetInfo').innerHTML = `当前纸型：<span class="paper-chip" style="background:${paperColor(pt.idx)}"></span><b>${pt.name}</b>`
+    + `（${fmt(pt.width)}×${fmt(pt.height)} mm · 单价 ${fmt(pt.price)} 元/张）`
+    + `｜本张已排 <b>${m.piecesPlaced}</b> 件 · 已排成品面积 ${fmt(m.placedArea)} mm²`
+    + ` · 单位已排面积成本 <b>${fmtCostPerArea(m.costPerArea)}</b> 元/mm²`;
+  $('sheetInfo').hidden = false;
+  renderStats(sheet.layout);
+  renderSvg(sheet.layout);
+  renderCutList(sheet.layout);
 }
 
 async function generate() {
@@ -366,18 +530,27 @@ async function generate() {
     return;
   }
 
-  const batch = currentMode() === 'batch';
+  const mode = currentMode();
+  const url = mode === 'batch'
+    ? '/api/layout/batch'
+    : mode === 'cost'
+      ? '/api/layout/cost-batch'
+      : '/api/layout';
   $('generate').disabled = true;
   try {
-    const resp = await fetch(batch ? '/api/layout/batch' : '/api/layout', {
+    const resp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || '排样失败');
-    if (batch) {
+    if (mode === 'batch') {
+      costState = null;
       renderBatch(data);
+    } else if (mode === 'cost') {
+      batchState = null;
+      renderCostBatch(data);
     } else {
       clearBatchUi();
       renderStats(data);
@@ -402,12 +575,24 @@ $('preset').addEventListener('change', (e) => {
 });
 document.querySelectorAll('input[name="mode"]').forEach((r) =>
   r.addEventListener('change', () => {
-    const batch = currentMode() === 'batch';
-    $('batchOpts').hidden = !batch;
-    $('generate').textContent = batch ? '生成排产方案' : '生成裁切方案';
+    const mode = currentMode();
+    $('batchOpts').hidden = mode !== 'batch';
+    $('costOpts').hidden = mode !== 'cost';
+    // 成本模式下纸张尺寸来自纸型表格，隐藏固定纸型相关字段（刀缝保留）
+    $('paperWField').hidden = mode === 'cost';
+    $('paperHField').hidden = mode === 'cost';
+    $('presetField').hidden = mode === 'cost';
+    $('generate').textContent = {
+      single: '生成裁切方案',
+      batch: '生成排产方案',
+      cost: '生成成本排产方案',
+    }[mode];
   })
 );
 $('addRow').addEventListener('click', () => addProductRow());
+$('addPaperRow').addEventListener('click', () => {
+  if ($('paperRows').children.length < 8) addPaperRow();
+});
 $('clearBtn').addEventListener('click', () => {
   $('productRows').innerHTML = '';
   addProductRow();
@@ -420,3 +605,7 @@ $('generate').addEventListener('click', generate);
 addProductRow('封面', 210, 285, 12);
 addProductRow('名片', 90, 54, 80);
 addProductRow();
+
+// 成本排产初始纸型示例
+addPaperRow('大度', 889, 1194, 3.5, 10);
+addPaperRow('正度', 787, 1092, 3, 8);

@@ -2,7 +2,7 @@
 
 const path = require('node:path');
 const express = require('express');
-const { layout, layoutBatch } = require('./src/packer');
+const { layout, layoutBatch, layoutCostBatch } = require('./src/packer');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -29,6 +29,17 @@ app.post('/api/layout/batch', (req, res) => {
   try {
     const body = req.body || {};
     const result = layoutBatch(body);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message || '输入无效' });
+  }
+});
+
+// 多纸型成本排产：每轮按单位已排面积成本选纸，直到完成 / 库存耗尽 / 无进展
+app.post('/api/layout/cost-batch', (req, res) => {
+  try {
+    const body = req.body || {};
+    const result = layoutCostBatch(body);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message || '输入无效' });
