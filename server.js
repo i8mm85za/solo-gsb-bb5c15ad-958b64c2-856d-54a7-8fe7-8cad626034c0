@@ -3,6 +3,7 @@
 const path = require('node:path');
 const express = require('express');
 const { layout, layoutBatch } = require('./src/packer');
+const { layoutCostBatch } = require('./src/cost');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -29,6 +30,17 @@ app.post('/api/layout/batch', (req, res) => {
   try {
     const body = req.body || {};
     const result = layoutBatch(body);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message || '输入无效' });
+  }
+});
+
+// 多纸型成本排产：2～8 种候选纸逐轮按单位面积成本择优
+app.post('/api/layout/cost', (req, res) => {
+  try {
+    const body = req.body || {};
+    const result = layoutCostBatch(body);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message || '输入无效' });
